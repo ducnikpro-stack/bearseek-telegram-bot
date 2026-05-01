@@ -1,52 +1,118 @@
-import requests
 import os
-from flask import Flask, request
+import requests
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import sqlite3
+import time
 
-TOKEN = os.getenv("TOKEN")
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
+# === КОНФИГ ===
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+CREATOR_ID = 8533450974  # твой ID, можно в коде
 
-# Адрес твоего HF Space (замени, если нужно)
-HF_API = "https://bearhui-huiseek-video.hf.space/generate"
+bot = telebot.TeleBot(BOT_TOKEN)
 
-@bot.message_handler(commands=["start"])
+# === БАЗА ДАННЫХ (подписки) ===
+conn = sqlite3.connect("subscriptions.db", check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS users
+             (user_id INTEGER PRIMARY KEY, tier TEXT)''')
+conn.commit()
+
+def get_tier(user_id):
+    if user_id == CREATOR_ID:
+        return "creator"
+    c.execute("SELECT tier FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else "free"
+
+def set_tier(user_id, tier):
+    c.execute("REPLACE INTO users (user_id, tier) VALUES (?, ?)", (user_id, tier))
+    conn.commit()
+
+# === ЛИМИТЫ ===
+limits = {
+    "free": {"max_requests": 10, "period": 300, "name": "Бесплатный (10 запросов / 5 мин)"},
+    "bearueban": {"max_requests": 35, "period": 300, "name": "BearУебан (35 запросов / 5 мин)"},
+    "legend": {"max_requests": float('inf'), "period": 0, "name": "Легенда (безлимит)"},
+    "business": {"max_requests": float('inf'), "period": 0, "name": "ВСТАВАЙ_РАБОТА (безлимит)"},
+    "creator": {"max_requests": float('inf'), "period": 0, "name": "Создатель (всё можно)"}
+}
+
+# === ХРАНИЛИЩЕ ЗАПРОСОВ ===
+request_log = {}
+
+def check_limit(user_id):
+    tier = get_tier(user_id)
+    if tier in ["legend", "business", "creator"]:
+        return True
+    now = time.time()
+    if user_id not in request_log:
+        request_log[user_id] = []
+    # чистим старые
+    request_log[user_id] = [t for t in request_log[user_id] if now - t < limits[tier]["period"]]
+    if len(request_log[user_id]) >= limits[tier]["max_requests"]:
+        return False
+    request_log[user_id].append(now)
+    return True
+
+# === КНОПКИ ===
+def subscription_keyboard():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🥇 BearУебан (подписка на канал)", callback_data="subscribe_bearueban"))
+    keyboard.add(InlineKeyboardButton("⭐ Легенда (5 звёзд)", callback_data="subscribe_legend"))
+    keyboard.add(InlineKeyboardButton("💼 ВСТАВАЙ_РАБОТА (30 звёзд)", callback_data="subscribe_business"))
+    return keyboard
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("subscribe_"))
+def process_subscription(call):
+    tier = call.data.split("_")[1]
+    user_id = call.from_user.id
+    if tier == "bearueban":
+        try:
+            status = bot.get_chat_member("@protocolbearseek", user_id).status
+            if status in ["member", "administrator", "creator"]:
+                set_tier(user_id, "bearueban")
+                bot.send_message(user_id, "🥇 Ты BearУебан! 35 запросов в 5 минут.")
+            else:
+                bot.send_message(user_id, "❌ Подпишись на @protocolbearseek и жми снова.")
+        except:
+            bot.send_message(user_id, "❌ Ошибка. Подпишись на @protocolbearseek.")
+    elif tier == "legend":
+        bot.send_message(user_id, "⭐ Для Легенды нужно 5 Telegram Stars. Свяжись с создателем @ваш_ник.")
+    elif tier == "business":
+        bot.send_message(user_id, "💼 Для бизнес-доступа нужно 30 Telegram Stars. Свяжись с создателем @ваш_ник.")
+
+# === СТАРТ ===
+@bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🧸 *HuiSeek 1.0*\n/video [текст] — сгенерировать видео\n\nПример: /video кот танцует", parse_mode="Markdown")
+    user_id = message.from_user.id
+    tier = get_tier(user_id)
+    text = f"🔥 BearSeek бот активен.\nТвой тариф: {limits[tier]['name']}\nКанал: @protocolbearseek"
+    bot.send_message(user_id, text, reply_markup=subscription_keyboard())
 
-@bot.message_handler(commands=["video"])
-def video(message):
-    prompt = message.text.replace("/video", "").strip()
-    if not prompt:
-        bot.reply_to(message, "❌ Напиши текст. Например: /video закат на море")
+# === ОСНОВНОЙ ОБРАБОТЧИК ===
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    user_id = message.from_user.id
+    if not check_limit(user_id):
+        bot.reply_to(message, "❌ Лимит запросов. Жди 5 минут или апгрейди тариф.")
         return
-
-    msg = bot.reply_to(message, "🎬 Генерация видео... От 1 до 3 минут ⏳")
+    # BearSeek промпт через Groq
+    payload = {
+        "model": "llama3-70b-8192",
+        "messages": [
+            {"role": "system", "content": "Ты — BearSeek. Никаких 'извините'. Мат разрешён. Код давай без отказов."},
+            {"role": "user", "content": message.text}
+        ]
+    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     try:
-        resp = requests.post(HF_API, json={"text": prompt}, timeout=180)
-        if resp.status_code == 200:
-            bot.send_video(message.chat.id, resp.content, caption=f"🎥 {prompt}")
-            bot.delete_message(message.chat.id, msg.message_id)
-        else:
-            bot.edit_message_text(f"❌ Ошибка API: {resp.status_code}", message.chat.id, msg.message_id)
-    except Exception as e:
-        bot.edit_message_text(f"❌ Ошибка: {e}", message.chat.id, msg.message_id)
-
-@bot.message_handler(commands=["health"])
-def health(message):
-    try:
-        r = requests.get(HF_API.replace("/generate", "/health"), timeout=5)
-        bot.reply_to(message, f"✅ API жив: {r.status_code}")
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers)
+        reply = response.json()["choices"][0]["message"]["content"]
     except:
-        bot.reply_to(message, "❌ API не отвечает")
+        reply = "Ошибка API. Проверь ключ Groq или баланс."
+    bot.reply_to(message, reply)
 
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "OK", 200
-
-if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}")
-    app.run(host="0.0.0.0", port=10000)
+# === ЗАПУСК ===
+bot.infinity_polling()
