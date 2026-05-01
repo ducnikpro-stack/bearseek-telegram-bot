@@ -6,7 +6,7 @@ import sqlite3
 import time
 
 # === КОНФИГ ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 CREATOR_ID = 8533450974  # твой ID, можно в коде
 
